@@ -1,13 +1,13 @@
+from django.db import connection
 from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
-from django.db import connection
 from django.urls import reverse
 
 from .models import Customer, Order, OrderItem
 
 
-# Strip middleware so the query counter measures the VIEW's queries only, not
-# silk's profiler writes, the tenant lookup, or session/auth queries.
+# Drop middleware so the query counter sees the view's queries only, not silk's
+# profiler writes, the tenant lookup or session/auth queries.
 @override_settings(MIDDLEWARE=[])
 class OrderSummaryQueryCountTests(TestCase):
     @classmethod
@@ -35,24 +35,19 @@ class OrderSummaryQueryCountTests(TestCase):
 
     def test_naive_endpoint_has_n_plus_one(self):
         url = reverse("orders:summary-naive") + f"?customer_id={self.customer.id}"
-        n = self._count_queries(url)
-        # 1 (orders) + 2 per order (customer + items) ~= 100+ queries.
-        self.assertGreater(n, 50)
+        self.assertGreater(self._count_queries(url), 50)
 
     def test_fixed_endpoint_is_constant(self):
         url = reverse("orders:summary") + f"?customer_id={self.customer.id}"
-        n = self._count_queries(url)
-        # orders + prefetched items (+ a couple of framework/session queries).
-        self.assertLessEqual(n, 6)
+        self.assertLessEqual(self._count_queries(url), 6)
 
     def test_fixed_uses_far_fewer_queries_than_naive(self):
-        naive_url = reverse("orders:summary-naive") + f"?customer_id={self.customer.id}"
-        fixed_url = reverse("orders:summary") + f"?customer_id={self.customer.id}"
-        self.assertLess(self._count_queries(fixed_url), self._count_queries(naive_url))
+        naive = reverse("orders:summary-naive") + f"?customer_id={self.customer.id}"
+        fixed = reverse("orders:summary") + f"?customer_id={self.customer.id}"
+        self.assertLess(self._count_queries(fixed), self._count_queries(naive))
 
     def test_summary_totals_are_correct(self):
         url = reverse("orders:summary") + f"?customer_id={self.customer.id}"
         row = self.client.get(url).json()["results"][0]
-        # 3 items x (2 * 1000 cents)
         self.assertEqual(row["item_count"], 3)
-        self.assertEqual(row["total_cents"], 6000)
+        self.assertEqual(row["total_cents"], 6000)  # 3 items x 2 x 1000

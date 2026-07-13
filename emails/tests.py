@@ -1,15 +1,3 @@
-"""Section 2 tests.
-
-Two levels:
-* ``TokenBucketRateLimiterTests`` — unit tests for the Redis limiter, driven by
-  a fake clock so refill is deterministic. Requires a running Redis.
-* ``QueueBurstTests`` — the required 500-job burst test. It drives the *real*
-  task logic (``process_email_job``) and the *real* Redis limiter through an
-  in-process broker (``InlineBroker``) that mimics Celery's reschedule-on-retry
-  behaviour with a fake clock. This lets us assert the three required
-  properties deterministically without a live worker.
-"""
-
 import heapq
 import unittest
 
@@ -35,6 +23,8 @@ REDIS_UP = _redis_available()
 
 
 class FakeClock:
+    """Lets us drive token refill without real sleeping."""
+
     def __init__(self, start=1_000_000.0):
         self.t = start
 
@@ -48,12 +38,12 @@ class FakeClock:
 @unittest.skipUnless(REDIS_UP, "Redis not available")
 class TokenBucketRateLimiterTests(TestCase):
     def _limiter(self, clock, capacity=10, window=10):
+        # these tests want the classic burst-allowed bucket, so start full
         lim = TokenBucketRateLimiter(
             key="test:unit",
             capacity=capacity,
             window_seconds=window,
             time_func=clock.time,
-            # These tests exercise the classic burst-allowed bucket, so start full.
             initial_tokens=capacity,
         )
         lim.reset()
@@ -63,7 +53,6 @@ class TokenBucketRateLimiterTests(TestCase):
         clock = FakeClock()
         lim = self._limiter(clock, capacity=10, window=10)
         allowed = sum(1 for _ in range(15) if lim.acquire())
-        # At a single instant only `capacity` tokens exist.
         self.assertEqual(allowed, 10)
 
     def test_refills_over_time(self):
@@ -71,8 +60,8 @@ class TokenBucketRateLimiterTests(TestCase):
         lim = self._limiter(clock, capacity=10, window=10)  # 1 token/sec
         for _ in range(10):
             lim.acquire()
-        self.assertFalse(lim.acquire())  # bucket empty
-        clock.advance(3)                 # 3 seconds -> ~3 tokens back
+        self.assertFalse(lim.acquire())  # empty
+        clock.advance(3)
         allowed = sum(1 for _ in range(5) if lim.acquire())
         self.assertEqual(allowed, 3)
 
@@ -82,7 +71,6 @@ class TokenBucketRateLimiterTests(TestCase):
         self.assertTrue(lim.acquire())
         result = lim.acquire()
         self.assertFalse(result.allowed)
-        # Need 1 token at 0.1/sec => ~10s.
         self.assertAlmostEqual(result.retry_after, 10, delta=1)
 
     def test_fails_closed_when_redis_down(self):
@@ -97,12 +85,9 @@ class TokenBucketRateLimiterTests(TestCase):
 
 
 class InlineBroker:
-    """Minimal broker that drives real task logic with a fake clock.
-
-    Holds ``(eta, seq, job_id, retries)`` in a heap. On a retry outcome the job
-    is re-enqueued at ``clock + countdown`` — exactly what Celery does with
-    ``self.retry(countdown=...)``, but without real sleeping. Records the fake
-    timestamp of each successful send so we can assert the rate limit.
+    """Stands in for Celery in tests: pops jobs off a heap, runs the real task
+    logic, and re-enqueues retries at clock+countdown (no real sleeping).
+    Records the time of each send so we can check the rate limit.
     """
 
     def __init__(self, limiter, clock):
@@ -121,12 +106,12 @@ class InlineBroker:
         while self._heap:
             eta, _, job_id, retries = heapq.heappop(self._heap)
             if self.clock.time() < eta:
-                self.clock.t = eta  # jump forward to the next scheduled job
+                self.clock.t = eta
             before = EmailJob.objects.get(pk=job_id).status
             outcome, info = tasks.process_email_job(job_id, self.limiter, retries)
             if outcome == tasks.SENT and before != EmailJob.Status.SENT:
                 self.send_times.append(self.clock.time())
-                self.clock.advance(0.001)  # each real send takes a little time
+                self.clock.advance(0.001)
             elif outcome == tasks.RETRY_RATE:
                 self.enqueue(job_id, retries, eta=self.clock.time() + info)
             elif outcome == tasks.RETRY_ERROR:
@@ -151,8 +136,7 @@ class QueueBurstTests(TestCase):
         capacity, window = 200, 60
         limiter = self._limiter(clock, capacity, window)
 
-        # 500 jobs; job index 42 will fail transiently exactly once, then succeed.
-        flaky_recipient = "user42@artikate.test"
+        flaky_recipient = "user42@artikate.test"  # fails once, then succeeds
         jobs = EmailJob.objects.bulk_create(
             [
                 EmailJob(recipient=f"user{i}@artikate.test",
@@ -161,7 +145,6 @@ class QueueBurstTests(TestCase):
             ]
         )
 
-        # Patch the provider to fail once for the flaky recipient.
         state = {"failed_once": False}
         real_send = tasks.send_email
 
@@ -180,22 +163,18 @@ class QueueBurstTests(TestCase):
         finally:
             tasks.send_email = real_send
 
-        # (1) No job is lost: every job reached a terminal state, all 500 sent.
+        # 1. nothing lost - every job ended up sent
         statuses = list(EmailJob.objects.values_list("status", flat=True))
         self.assertEqual(len(statuses), 500)
         self.assertTrue(all(s == EmailJob.Status.SENT for s in statuses))
-        self.assertEqual(EmailJob.objects.filter(status=EmailJob.Status.SENT).count(), 500)
 
-        # (2) Rate limit never exceeded: no 60s sliding window has > 200 sends.
+        # 2. no 60s window ever exceeded the cap
         times = sorted(broker.send_times)
         for i, start in enumerate(times):
             window_count = sum(1 for t in times[i:] if t < start + window)
-            self.assertLessEqual(
-                window_count, capacity,
-                f"rate exceeded: {window_count} sends within {window}s at t={start}",
-            )
+            self.assertLessEqual(window_count, capacity)
 
-        # (3) The intentional failure was retried and eventually succeeded.
+        # 3. the flaky one retried and eventually went through
         flaky = EmailJob.objects.get(recipient=flaky_recipient)
         self.assertEqual(flaky.status, EmailJob.Status.SENT)
         self.assertGreaterEqual(flaky.attempts, 2)
@@ -220,7 +199,6 @@ class QueueBurstTests(TestCase):
             EmailProviderError("always fails")
         )
         try:
-            # At the retry ceiling, the job is dead-lettered instead of retried.
             outcome, _ = tasks.process_email_job(
                 job.id, limiter, retries=tasks.MAX_RETRIES
             )

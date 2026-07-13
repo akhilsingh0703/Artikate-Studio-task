@@ -1,11 +1,3 @@
-"""Seed a heavy customer so the Section 1 N+1 regression is observable.
-
-    python manage.py seed_orders --orders 250 --items 3
-
-Creates one customer with the requested number of orders (default 250, above
-the 200-order threshold from the incident), each with a few order items.
-"""
-
 import random
 
 from django.core.management.base import BaseCommand
@@ -17,10 +9,10 @@ PRODUCTS = ["Poster Print", "Canvas", "Sticker Pack", "Art Book", "Frame", "Mug"
 
 
 class Command(BaseCommand):
-    help = "Create a customer with many orders/items to demonstrate the N+1 fix."
+    help = "Create one customer with lots of orders/items to show the N+1 fix."
 
     def add_arguments(self, parser):
-        parser.add_argument("--orders", type=int, default=250)
+        parser.add_argument("--orders", type=int, default=250)  # above the 200 threshold
         parser.add_argument("--items", type=int, default=3)
 
     @transaction.atomic
@@ -35,10 +27,7 @@ class Command(BaseCommand):
 
         orders = Order.objects.bulk_create(
             [
-                Order(
-                    customer=customer,
-                    status=random.choice(Order.Status.values),
-                )
+                Order(customer=customer, status=random.choice(Order.Status.values))
                 for _ in range(n_orders)
             ]
         )
@@ -60,9 +49,7 @@ class Command(BaseCommand):
             self.style.SUCCESS(
                 f"Created customer id={customer.id} with {n_orders} orders "
                 f"and {len(items)} items.\n"
-                f"Try:\n"
-                f"  /api/orders/summary/naive/?customer_id={customer.id}\n"
-                f"  /api/orders/summary/?customer_id={customer.id}\n"
-                f"then compare query counts at /silk/"
+                f"Compare /api/orders/summary/naive/?customer_id={customer.id} "
+                f"and /api/orders/summary/?customer_id={customer.id} at /silk/"
             )
         )

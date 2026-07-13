@@ -1,22 +1,3 @@
-"""Celery tasks for the rate-limited email queue (Section 2).
-
-Design summary (full reasoning in DESIGN.md):
-
-* The decision logic lives in :func:`process_email_job`, a plain function that
-  returns an *outcome* and takes no Celery internals. The Celery task is a thin
-  wrapper that translates outcomes into ``self.retry`` calls. This keeps the
-  hard-to-test parts (rate limiting, backoff, dead-lettering) unit-testable
-  without a live broker.
-* Rate limiting: before sending, acquire a token from the Redis token bucket.
-  If none is available the job is retried after ``retry_after`` — it goes back
-  on the broker, never blocking the worker with ``time.sleep()``.
-* Transient failures retry with **exponential backoff + jitter**, capped at
-  ``MAX_RETRIES``; then they are dead-lettered.
-* Permanent failures are dead-lettered immediately.
-* Crash safety comes from ``task_acks_late=True`` + ``reject_on_worker_lost``
-  (settings): a SIGKILL'd worker's un-acked job is redelivered.
-"""
-
 import random
 
 from celery import shared_task
@@ -29,53 +10,51 @@ from .rate_limiter import TokenBucketRateLimiter
 logger = get_task_logger(__name__)
 
 MAX_RETRIES = 5
-RATE_LIMIT_MAX_RETRIES = 50  # throttling is expected under burst; retry a lot
+RATE_LIMIT_MAX_RETRIES = 50  # being throttled is normal under a burst
 
-# Outcome codes returned by process_email_job.
+# outcomes returned by process_email_job
 SENT = "sent"
 DEAD = "dead"
 SKIP = "skip"
-RETRY_RATE = "retry_rate"    # no token available; reschedule, don't count as failure
-RETRY_ERROR = "retry_error"  # transient provider error; backoff retry
+RETRY_RATE = "retry_rate"
+RETRY_ERROR = "retry_error"
 
 
 def email_rate_limiter():
-    # Global bucket shared by all workers -> enforces the provider-wide cap.
+    # one global bucket shared by all workers = the provider-wide cap
     return TokenBucketRateLimiter(key="email:global")
 
 
 def backoff_seconds(attempt):
-    # 2 ** attempt with full jitter, capped at 60s. attempt is 0-based.
     base = min(2 ** attempt, 60)
-    return base / 2 + random.uniform(0, base / 2)
+    return base / 2 + random.uniform(0, base / 2)  # full jitter
 
 
 def _dead_letter(job, error):
     job.status = EmailJob.Status.DEAD
     job.last_error = str(error)
-    job.save(update_fields=["status", "attempts", "last_error", "updated_at"])
+    job.save(update_fields=["status", "last_error", "attempts", "updated_at"])
     DeadLetter.objects.get_or_create(email_job=job, defaults={"error": str(error)})
-    logger.error("EmailJob %s dead-lettered: %s", job.pk, error)
+    logger.error("dead-lettered EmailJob %s: %s", job.pk, error)
 
 
 def process_email_job(job_id, limiter, retries):
-    """Pure decision function for a single job.
+    """Decide what to do with one job and do the DB writes.
 
-    Returns ``(outcome, info)`` where ``info`` is a countdown (for retries),
-    an error, or ``None``. Performs the DB writes/side effects but leaves the
-    actual rescheduling to the caller (the Celery task or a test harness).
+    Returns (outcome, info). Rescheduling is left to the caller so this can be
+    unit-tested without a running worker.
     """
     try:
         job = EmailJob.objects.get(pk=job_id)
     except EmailJob.DoesNotExist:
         return SKIP, "missing"
 
+    # acks_late means a job can be redelivered after a crash that happened
+    # between send and ack, so don't send it twice.
     if job.status == EmailJob.Status.SENT:
-        # Idempotency: acks_late means a job can be redelivered after a crash
-        # that happened *after* send but *before* ack. Don't send twice.
         return SKIP, "already-sent"
 
-    result = limiter.acquire(tokens=1)
+    result = limiter.acquire()
     if not result.allowed:
         return RETRY_RATE, max(result.retry_after, 0.05)
 

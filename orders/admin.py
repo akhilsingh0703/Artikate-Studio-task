@@ -18,8 +18,7 @@ class CustomerAdmin(admin.ModelAdmin):
 class OrderAdmin(admin.ModelAdmin):
     list_display = ["id", "customer", "status", "created_at"]
     list_filter = ["status"]
-    # Avoids an N+1 on the changelist when rendering ``customer``.
-    list_select_related = ["customer"]
+    list_select_related = ["customer"]  # no N+1 on the changelist
     inlines = [OrderItemInline]
 
 

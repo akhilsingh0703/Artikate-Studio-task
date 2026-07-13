@@ -1,14 +1,8 @@
-"""Per-request tenant context.
-
-Stored in :class:`threading.local` so a queryset built anywhere in the request
-lifecycle can discover the active tenant without it being threaded through every
-function signature. See ANSWERS.md (Section 3) for why thread-locals are unsafe
-under async Django and what ``contextvars`` would change.
-"""
-
 import threading
 from contextlib import contextmanager
 
+# Current tenant for the request, kept in thread-local storage so querysets can
+# find it without it being passed through every call.
 _state = threading.local()
 
 
@@ -27,8 +21,8 @@ def clear_current_tenant():
 
 @contextmanager
 def tenant_context(tenant):
-    """Bind ``tenant`` for the duration of the block, restoring the previous
-    value on exit. Handy in tests, management commands and Celery tasks."""
+    """Bind a tenant for the block, restore the previous one after. Handy in
+    tests, management commands and Celery tasks."""
     previous = get_current_tenant()
     set_current_tenant(tenant)
     try:

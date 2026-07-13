@@ -1,9 +1,4 @@
-"""
-Django settings for the Artikate Studio backend assessment.
-
-Configuration is intentionally driven by environment variables (with sane
-local defaults) so the project runs in under 5 minutes from a clean clone.
-"""
+"""Django settings. Env vars with local defaults so it runs out of the box."""
 
 import os
 from pathlib import Path
@@ -50,9 +45,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    # Section 1 profiler. Kept high in the stack so it captures view queries.
     "silk.middleware.SilkyMiddleware",
-    # Section 3 tenant scoping. Runs after auth so JWT/subdomain is resolvable.
     "tenants.middleware.TenantMiddleware",
 ]
 
@@ -108,15 +101,11 @@ REST_FRAMEWORK = {
     ],
 }
 
-# ---------------------------------------------------------------------------
-# django-silk (Section 1 profiling)
-# ---------------------------------------------------------------------------
+# django-silk
 SILKY_PYTHON_PROFILER = True
 SILKY_META = True
 
-# ---------------------------------------------------------------------------
-# Redis / Celery (Section 2)
-# ---------------------------------------------------------------------------
+# Redis / Celery
 REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", REDIS_URL)
@@ -126,26 +115,19 @@ CELERY_RESULT_SERIALIZER = "json"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TIMEZONE = "UTC"
 
-# Crash-safety: only acknowledge a message AFTER the task returns, and treat a
-# lost worker connection as a task that must be redelivered. See ANSWERS.md
-# (SIGKILL question) and DESIGN.md for the reasoning behind these two flags.
+# Only ack a message after the task returns, and redeliver if a worker dies
+# mid-task. This is what keeps a SIGKILL'd worker from losing jobs.
 CELERY_TASK_ACKS_LATE = True
 CELERY_TASK_REJECT_ON_WORKER_LOST = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 
-# Run tasks synchronously inside tests so assertions are deterministic without a
-# live worker. Overridden to False by the live worker / management command.
 CELERY_TASK_ALWAYS_EAGER = env_bool("CELERY_TASK_ALWAYS_EAGER", False)
 CELERY_TASK_EAGER_PROPAGATES = True
 
-# ---------------------------------------------------------------------------
-# Email rate limiter (Section 2)
-# ---------------------------------------------------------------------------
-EMAIL_RATE_LIMIT = int(os.environ.get("EMAIL_RATE_LIMIT", "200"))  # tokens
+# Email rate limiter
+EMAIL_RATE_LIMIT = int(os.environ.get("EMAIL_RATE_LIMIT", "200"))
 EMAIL_RATE_WINDOW_SECONDS = int(os.environ.get("EMAIL_RATE_WINDOW_SECONDS", "60"))
 
-# ---------------------------------------------------------------------------
-# Tenant scoping (Section 3)
-# ---------------------------------------------------------------------------
+# Tenant scoping
 TENANT_JWT_SECRET = os.environ.get("TENANT_JWT_SECRET", SECRET_KEY)
 TENANT_BASE_DOMAIN = os.environ.get("TENANT_BASE_DOMAIN", "artikate.test")

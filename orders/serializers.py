@@ -20,9 +20,8 @@ class OrderSummarySerializer(serializers.ModelSerializer):
         model = Order
         fields = ["id", "status", "created_at", "customer_name", "item_count", "total_cents"]
 
+    # len() / iterating .all() read the prefetch cache; .count() would re-query.
     def get_item_count(self, order):
-        # Relies on ``order.items`` already being prefetched by the view. Calling
-        # .count() here would re-issue a COUNT query per row (another N+1).
         return len(order.items.all())
 
     def get_total_cents(self, order):

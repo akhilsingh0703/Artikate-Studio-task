@@ -1,6 +1,6 @@
 from django.test import TestCase
 
-from .context import clear_current_tenant, tenant_context
+from .context import clear_current_tenant, get_current_tenant, tenant_context
 from .middleware import TenantMiddleware
 from .models import Project, Tenant
 from .tokens import make_tenant_token
@@ -23,11 +23,9 @@ class TenantScopingTests(TestCase):
         self.assertEqual(names, {"A-only"})
 
     def test_tenant_a_cannot_read_tenant_b_via_filter(self):
+        # even explicitly filtering for B's row returns nothing
         with tenant_context(self.tenant_a):
-            # Even an explicit filter for B's row returns nothing: the manager
-            # has already narrowed the base queryset to tenant A.
-            leaked = Project.objects.filter(name="B-only")
-            self.assertEqual(list(leaked), [])
+            self.assertEqual(list(Project.objects.filter(name="B-only")), [])
 
     def test_tenant_a_cannot_get_tenant_b_by_pk(self):
         b_project = Project.all_objects.get(name="B-only")
@@ -69,13 +67,10 @@ class TenantMiddlewareTests(TestCase):
         return captured
 
     def test_binds_and_clears_from_jwt(self):
-        token = make_tenant_token("acme")
-        result = self._run(HTTP_AUTHORIZATION=f"Bearer {token}")
+        result = self._run(HTTP_AUTHORIZATION=f"Bearer {make_tenant_token('acme')}")
         self.assertEqual(result["tenant"], self.tenant_a)
         self.assertEqual(result["visible"], ["A-only"])
-        # Context is cleared after the request completes.
-        from .context import get_current_tenant
-        self.assertIsNone(get_current_tenant())
+        self.assertIsNone(get_current_tenant())  # cleared after the request
 
     def test_binds_from_subdomain(self):
         result = self._run(HTTP_HOST="acme.artikate.test")

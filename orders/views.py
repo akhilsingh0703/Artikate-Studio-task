@@ -1,21 +1,15 @@
-"""Section 1 — order summary endpoint.
-
-Two implementations of the same endpoint are exposed so the N+1 regression and
-its fix can be profiled side by side with django-silk:
-
-* ``summary_naive``  -> /api/orders/summary/naive/   (reproduces the bug)
-* ``order_summary``  -> /api/orders/summary/         (the fixed version)
-
-Both accept ``?customer_id=<id>`` to scope the summary to a single customer,
-mirroring the mobile dashboard call described in the scenario.
-"""
-
 from django.db.models import Prefetch
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
 from .models import Order, OrderItem
 from .serializers import OrderSummarySerializer
+
+# Two versions of the same endpoint so the N+1 and its fix can be compared in
+# silk:
+#   /api/orders/summary/naive/  - reproduces the bug
+#   /api/orders/summary/        - the fix
+# Both take ?customer_id=<id> to scope to one customer.
 
 
 def _base_queryset(request):
@@ -28,14 +22,9 @@ def _base_queryset(request):
 
 @api_view(["GET"])
 def summary_naive(request):
-    """Deliberately slow version.
-
-    ``Order.objects.all()`` loads only the orders. Every ``customer.name`` in
-    the serializer triggers one extra SELECT on ``orders_customer`` and every
-    ``order.items.all()`` triggers one extra SELECT on ``orders_orderitem``.
-    For N orders that is 1 + 2N queries, so 200 orders => ~401 queries. That is
-    the 30s timeout in the incident.
-    """
+    # Loads only orders, so each customer.name and each order.items.all() in the
+    # serializer fires its own query -> 1 + 2N. 200 orders ~= 400+ queries,
+    # which is the 30s timeout.
     orders = _base_queryset(request)
     data = OrderSummarySerializer(orders, many=True).data
     return Response({"count": len(data), "results": data})
@@ -43,15 +32,8 @@ def summary_naive(request):
 
 @api_view(["GET"])
 def order_summary(request):
-    """Fixed version — constant query count regardless of order volume.
-
-    * ``select_related("customer")`` turns the per-row customer lookup into a
-      single SQL JOIN (resolved in the initial query, no extra round trips).
-    * ``prefetch_related`` batches every related item into ONE ``IN (...)``
-      query, then joins them in Python.
-
-    Total: 2 queries (orders + items) whether there are 5 orders or 5,000.
-    """
+    # select_related folds the to-one customer into the initial JOIN; prefetch
+    # pulls all items in one IN (...) query. 2 queries regardless of order count.
     orders = (
         _base_queryset(request)
         .select_related("customer")
