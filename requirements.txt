@@ -1,0 +1,7 @@
+# Direct dependencies (transitive deps are resolved by pip).
+Django==5.0.14
+djangorestframework==3.17.1
+celery==5.6.3
+redis==8.0.1
+django-silk==5.5.0
+PyJWT==2.13.0

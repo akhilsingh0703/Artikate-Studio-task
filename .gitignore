@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+
+# Env / secrets (never commit)
+.env
+*.env
+
+# django-silk profiler dumps
+silk_profiles/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
