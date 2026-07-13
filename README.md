@@ -1,113 +1,108 @@
-# Artikate Studio — Backend Developer Assessment
+# Artikate Studio — Backend Assessment
 
-Django backend covering all four assessment sections. Written reasoning lives in
-[`ANSWERS.md`](./ANSWERS.md); the Section 2 architecture write-up is in
-[`DESIGN.md`](./DESIGN.md).
+A Django backend covering the four assessment sections. The written reasoning is
+split across `ANSWERS.md` (Sections 1, 3 and 4) and `DESIGN.md` (the Section 2
+queue design).
 
-| Section | Topic | Where |
-| --- | --- | --- |
-| 1 | N+1 diagnosis & fix + django-silk evidence | `orders/` · `ANSWERS.md` §1 |
-| 2 | Rate-limited async job queue (Celery + Redis) | `emails/` · `DESIGN.md` |
-| 3 | Multi-tenant ORM isolation | `tenants/` · `ANSWERS.md` §3 |
-| 4 | Written architecture review (Q A & B) | `ANSWERS.md` §4 |
+Section map:
+
+- Section 1 — N+1 diagnosis and fix, with silk evidence — `orders/`, `ANSWERS.md` §1
+- Section 2 — rate-limited async email queue (Celery + Redis) — `emails/`, `DESIGN.md`
+- Section 3 — multi-tenant ORM isolation — `tenants/`, `ANSWERS.md` §3
+- Section 4 — architecture write-up (questions A and B) — `ANSWERS.md` §4
 
 ## Requirements
 
 - Python 3.10+
-- Redis (for the rate limiter and Celery broker) — `redis-server`
+- Redis, for the rate limiter and the Celery broker
 
-## Setup (under 5 minutes)
+## Setup
 
 ```bash
-# 1. Create a virtualenv and install deps
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. Make sure Redis is running (default redis://127.0.0.1:6379/0)
+# Redis, if it isn't already up (default redis://127.0.0.1:6379/0)
 redis-server --daemonize yes        # or: sudo service redis-server start
 
-# 3. Migrate and create an admin user
 python manage.py migrate
 python manage.py createsuperuser     # optional, for /admin and /silk
-
-# 4. Run the server
 python manage.py runserver
 ```
 
-Everything is configured with sane local defaults; no `.env` is required. All
-tunables (Redis URL, rate limit, JWT secret) are environment variables read in
-`config/settings.py`.
+There's no `.env` to fill in — everything has a local default. The tunables
+(Redis URL, rate limit, JWT secret) are read from env vars in
+`config/settings.py` if you want to override them.
 
-## Run the tests
+## Tests
 
 ```bash
 python manage.py test
 ```
 
-19 tests. The Section 2 rate-limiter/queue tests require a running Redis; they
-**skip** automatically if Redis is unavailable. The 500-job burst test is the
-slowest (it drives the real limiter through thousands of Redis operations).
+19 tests. The Section 2 limiter/queue tests need Redis running and skip
+themselves if it isn't reachable. The 500-job burst test is the slow one — it
+pushes the real limiter through thousands of Redis calls, so the suite takes a
+couple of minutes.
 
-## Section 1 — N+1 demo (see the fix with django-silk)
+## Section 1 — seeing the N+1 in silk
 
 ```bash
-# Seed a customer with 250 orders (above the incident's 200-order threshold)
 python manage.py seed_orders --orders 250 --items 3
 python manage.py runserver
 ```
 
-Then compare the two endpoints and their query counts at **http://127.0.0.1:8000/silk/**:
+Then open http://127.0.0.1:8000/silk/ and compare the query counts for the two
+endpoints:
 
-- Slow (N+1):  `GET /api/orders/summary/naive/?customer_id=<id>`  → ~501 queries
-- Fixed:       `GET /api/orders/summary/?customer_id=<id>`        → 2 queries
+- `GET /api/orders/summary/naive/?customer_id=<id>` — ~501 queries (the bug)
+- `GET /api/orders/summary/?customer_id=<id>` — 2 queries (the fix)
 
-Full investigation log, root-cause justification, and the DB/ORM-level
-explanation of the fix are in `ANSWERS.md` §1.
+The investigation log and the DB/ORM explanation are in `ANSWERS.md` §1.
 
-## Section 2 — Rate-limited email queue (Celery + Redis)
+## Section 2 — running the email queue
 
-Open three terminals (all with the venv active):
+Three terminals, all with the venv active:
 
 ```bash
-# Terminal 1 — Redis (if not already running)
+# 1: Redis (skip if already running)
 redis-server
 
-# Terminal 2 — Celery worker
+# 2: Celery worker
 celery -A config worker -l info
 
-# Terminal 3 — submit a burst of 500 jobs, 10% intentionally invalid
+# 3: fire 500 jobs, 10% of them intentionally invalid
 python manage.py migrate
 python manage.py submit_emails --count 500 --fail-rate 0.1
 ```
 
-Watch the worker drain jobs at ~200/minute (the token bucket throttles the rest
-with retries — no `time.sleep`). Inspect state:
+The worker drains at ~200/min; the token bucket throttles the rest by
+rescheduling retries rather than sleeping. Poke at the state with:
 
 ```bash
-redis-cli llen celery                # queued jobs remaining
-redis-cli hgetall ratelimit:email:global   # token bucket contents
+redis-cli llen celery
+redis-cli hgetall ratelimit:email:global
 ```
 
-Sent/failed/dead-lettered jobs are visible in the admin under **Email jobs** and
-**Dead letters** (http://127.0.0.1:8000/admin/).
+Sent/failed/dead-lettered jobs show up in the admin under Email jobs and Dead
+letters. The trade-offs and the SIGKILL story are in `DESIGN.md` and
+`ANSWERS.md` §2.
 
-- Architecture trade-offs, token-bucket rationale, atomicity, and the SIGKILL
-  behaviour: `DESIGN.md` and `ANSWERS.md` §2.
+## Section 3 — tenant isolation
 
-## Section 3 — Multi-tenant isolation
+- `tenants/models.py` — `TenantManager` adds `.filter(tenant=...)` to every
+  queryset (`.all()`, `.filter()`, `.get()`), so a forgotten filter can't leak
+  another tenant's rows. `all_objects` is the deliberate unscoped escape hatch.
+- `tenants/middleware.py` — resolves the tenant from a JWT, an `X-Tenant`
+  header, or the subdomain, binds it for the request and clears it in a
+  `finally`.
+- `tenants/tests.py` — proves the negative: tenant A can't reach B's rows by
+  filter or by pk, and `.all()` doesn't bypass the scoping.
 
-- `tenants/models.py` — `TenantManager` auto-applies `.filter(tenant=...)` to
-  **every** queryset (`.all()`, `.filter()`, `.get()`), so a forgotten filter
-  cannot leak data. `all_objects` is the deliberate unscoped escape hatch.
-- `tenants/middleware.py` — resolves the tenant from a JWT (`Authorization:
-  Bearer`), an `X-Tenant` header, or the subdomain, binds it for the request,
-  and clears it in a `finally` block.
-- Tests prove the *negative* (tenant A cannot read tenant B by filter or by pk,
-  and `.all()` does not bypass scoping): `tenants/tests.py`.
-- Async safety / `contextvars` discussion: `ANSWERS.md` §3.
+The async-safety / `contextvars` discussion is in `ANSWERS.md` §3.
 
-## Project layout
+## Layout
 
 ```
 config/     Django project + Celery app (config/celery.py)
@@ -118,6 +113,6 @@ tenants/    Section 3 — Tenant/Project, TenantManager, tenant middleware
 
 ## Notes
 
-- No secrets or `.env` files are committed (`.gitignore` covers them). The
-  `SECRET_KEY` default is clearly marked local-only.
+- No secrets or `.env` files are committed. The `SECRET_KEY` default is marked
+  local-only.
 - `db.sqlite3` is created locally and git-ignored.
