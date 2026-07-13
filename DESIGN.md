@@ -29,45 +29,48 @@ CELERY_TASK_REJECT_ON_WORKER_LOST = True  # lost worker -> requeue, don't ack
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1     # don't hoard messages a crash would drop
 ```
 
-## The rate limiter: a Redis token bucket
+## The rate limiter: a Redis sliding-window log
 
-It's in `emails/rate_limiter.py`, implemented as a token bucket inside a single
-Lua script (`EVAL`).
+It's in `emails/rate_limiter.py`: a sorted set of timestamps per key, driven by
+a single Lua script (`EVAL`). Each allowed send drops a `now`-scored member in
+the set; every call first trims everything older than the window and counts
+what's left.
 
-Why token bucket and not the other two:
+Why this and not the other two:
 
-- Fixed window (INCR + EXPIRE) lets a client send a full `capacity` at 00:59.9
-  and another full `capacity` at 01:00.0, i.e. double the limit across the
-  boundary. That's a non-starter against a hard provider cap.
-- Sliding window (a sorted set + ZREMRANGEBYSCORE) is accurate, but it stores
-  one member per request. During a 2,000-request burst that's 2,000 members per
-  key, and both memory and the O(log N) insert cost grow with traffic.
-- Token bucket stores just two numbers per key (`tokens` and `ts`). It enforces
-  a steady refill rate *and* a bounded burst, and it can hand back a precise
-  `retry_after` so callers reschedule instead of spinning.
+- Fixed window (INCR + EXPIRE) lets a client send a full limit at 00:59.9 and
+  another full limit at 01:00.0 — 2x the cap across the boundary. Non-starter
+  against a hard provider cap.
+- A **token bucket** is the tempting answer (it stores only two numbers), but it
+  does *not* give a hard "N per rolling minute". A bucket of capacity `C` and
+  rate `r` allows up to `C + r*window` in some window. With `C = 200` and
+  `r = 200/60` that's up to ~400 in a 60s window, and under real concurrent
+  workers I measured a 60s window hit **219** — over the provider cap. Shrinking
+  `C` to fix that just turns the bucket into a worse approximation of a sliding
+  window.
+- The sliding-window log is exactly the "≤ N per rolling window" guarantee the
+  brief asks for. At every allowed send the trailing-window count is `≤ limit`,
+  which means *any* window of `window` length holds `≤ limit` sends.
+
+The usual knock on the sliding-window log is memory — one member per request.
+Here it's bounded: excess acquires are *denied*, not stored, so a key only ever
+holds up to `limit` (~200) live timestamps regardless of how big the burst is.
+A 2,000-request spike queues 2,000 jobs on the broker but the limiter set stays
+at ~200. Old members expire via the window trim plus a TTL.
 
 ### Atomicity
 
-The whole "read tokens, refill by elapsed time, maybe consume, write back"
-sequence runs in one Lua script. Redis runs a script as a single atomic,
-blocking unit, so two workers can't both read the same count and double-spend
-it. That's stronger than a MULTI/EXEC transaction (which can't branch on a value
-it read mid-transaction) and simpler than WATCH-based optimistic retries.
-
-### The cold-start trade-off
-
-`initial_tokens` defaults to 0 for the email bucket. If the bucket started full
-it would allow an immediate burst of `capacity` on top of the refill — up to 2x
-capacity in the first window. Starting empty turns the limiter into a pure
-smoother: under the flash-sale's sustained pressure it emits at exactly the
-refill rate (200/min), which is what the burst test checks. If a cold-start
-burst is fine for some bucket, pass `initial_tokens=capacity`.
+The whole "trim old, count, maybe insert, write" sequence runs in one Lua
+script. Redis runs a script as a single atomic, blocking unit, so two workers
+can't both see the same count and double-spend a slot. That's stronger than a
+MULTI/EXEC transaction (which can't branch on a value it read mid-transaction)
+and simpler than WATCH-based optimistic retries.
 
 ### Failure mode: fail closed
 
 If Redis is unreachable, `acquire()` returns "not allowed" by default. Blowing
 past a hard third-party cap can get the whole account throttled or banned, so
-not sending is the safer default. Buckets that don't care can pass
+not sending is the safer default. Callers that don't care can pass
 `fail_open=True`.
 
 ## Retry and dead-letter
@@ -75,9 +78,15 @@ not sending is the safer default. Buckets that don't care can pass
 `emails/tasks.py` keeps the decision logic in a plain `process_email_job()`
 (testable without a broker) and wraps it in a thin Celery task:
 
-- Rate-limited -> `self.retry(countdown=retry_after)` with a high ceiling
-  (`RATE_LIMIT_MAX_RETRIES`), since being throttled is expected, not a failure.
-  No `time.sleep()` — the job goes back on the broker.
+- Rate-limited -> `self.retry(countdown=retry_after + jitter)`. The task is
+  declared `max_retries=None` (unlimited) because being throttled is flow
+  control, not a failure. A finite cap here is a job-loss bug: under a sustained
+  backlog a job can be rate-limited more times than the cap and then get
+  dropped. (Watch out: `self.retry(max_retries=None)` does *not* mean unlimited
+  — Celery reads `None` there as "use the task default" — so it has to be set on
+  the task.) The jitter spreads a few hundred rescheduled jobs out in time so
+  they don't all wake up and re-collide at once (a thundering herd). No
+  `time.sleep()` — the job goes back on the broker.
 - Transient provider error (`EmailProviderError`) -> `self.retry` with
   exponential backoff and full jitter (`2 ** attempt`, capped at 60s), up to
   `MAX_RETRIES = 5`.
@@ -102,5 +111,13 @@ reschedule-on-retry without actually sleeping. The 500-job test asserts:
 2. The rate is never exceeded — no 60-second window contains more than 200 sends.
 3. Retries work — an intentional transient failure retries and eventually
    succeeds (`attempts >= 2`, final status `SENT`).
+
+The `InlineBroker` reschedules rate-limited jobs indefinitely, which is what the
+real system does — but that means it *can't* catch a finite retry cap in the
+actual Celery wrapper. `RateLimitRetryPolicyTests` covers that gap directly
+(the task must be `max_retries=None`, and a rate-limited job must reschedule
+rather than drop). This split matters: an earlier version passed the 500-job
+test but lost hundreds of jobs live, because the cap only bit under a real
+worker.
 
 The SIGKILL walk-through is in `ANSWERS.md` §2.

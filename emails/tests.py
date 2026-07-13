@@ -1,14 +1,16 @@
 import heapq
 import unittest
+from unittest import mock
 
 import redis as redis_lib
+from celery.exceptions import Retry
 from django.conf import settings
 from django.test import TestCase
 
 from . import tasks
 from .models import DeadLetter, EmailJob
 from .provider import EmailProviderError
-from .rate_limiter import TokenBucketRateLimiter
+from .rate_limiter import RateLimitResult, SlidingWindowRateLimiter
 
 
 def _redis_available():
@@ -23,7 +25,7 @@ REDIS_UP = _redis_available()
 
 
 class FakeClock:
-    """Lets us drive token refill without real sleeping."""
+    """Lets us drive the window clock without real sleeping."""
 
     def __init__(self, start=1_000_000.0):
         self.t = start
@@ -36,47 +38,47 @@ class FakeClock:
 
 
 @unittest.skipUnless(REDIS_UP, "Redis not available")
-class TokenBucketRateLimiterTests(TestCase):
-    def _limiter(self, clock, capacity=10, window=10):
-        # these tests want the classic burst-allowed bucket, so start full
-        lim = TokenBucketRateLimiter(
+class SlidingWindowRateLimiterTests(TestCase):
+    def _limiter(self, clock, limit=10, window=10):
+        lim = SlidingWindowRateLimiter(
             key="test:unit",
-            capacity=capacity,
+            limit=limit,
             window_seconds=window,
             time_func=clock.time,
-            initial_tokens=capacity,
         )
         lim.reset()
         return lim
 
-    def test_allows_up_to_capacity_then_blocks(self):
+    def test_allows_up_to_limit_then_blocks(self):
         clock = FakeClock()
-        lim = self._limiter(clock, capacity=10, window=10)
+        lim = self._limiter(clock, limit=10, window=10)
         allowed = sum(1 for _ in range(15) if lim.acquire())
         self.assertEqual(allowed, 10)
 
-    def test_refills_over_time(self):
+    def test_frees_up_after_the_window_passes(self):
         clock = FakeClock()
-        lim = self._limiter(clock, capacity=10, window=10)  # 1 token/sec
+        lim = self._limiter(clock, limit=10, window=10)
         for _ in range(10):
             lim.acquire()
-        self.assertFalse(lim.acquire())  # empty
+        self.assertFalse(lim.acquire())  # full
         clock.advance(3)
-        allowed = sum(1 for _ in range(5) if lim.acquire())
-        self.assertEqual(allowed, 3)
+        self.assertFalse(lim.acquire())  # entries still inside the window
+        clock.advance(7)  # the first batch is now older than the window
+        allowed = sum(1 for _ in range(10) if lim.acquire())
+        self.assertEqual(allowed, 10)
 
-    def test_retry_after_is_reported_when_blocked(self):
+    def test_retry_after_points_at_when_a_slot_frees(self):
         clock = FakeClock()
-        lim = self._limiter(clock, capacity=1, window=10)  # 0.1 token/sec
+        lim = self._limiter(clock, limit=1, window=10)
         self.assertTrue(lim.acquire())
         result = lim.acquire()
         self.assertFalse(result.allowed)
         self.assertAlmostEqual(result.retry_after, 10, delta=1)
 
     def test_fails_closed_when_redis_down(self):
-        lim = TokenBucketRateLimiter(
+        lim = SlidingWindowRateLimiter(
             key="test:down",
-            capacity=10,
+            limit=10,
             window_seconds=10,
             client=redis_lib.Redis.from_url("redis://127.0.0.1:6390/0"),
             fail_open=False,
@@ -120,21 +122,20 @@ class InlineBroker:
 
 @unittest.skipUnless(REDIS_UP, "Redis not available")
 class QueueBurstTests(TestCase):
-    def _limiter(self, clock, capacity=200, window=60, initial_tokens=0):
-        lim = TokenBucketRateLimiter(
+    def _limiter(self, clock, limit=200, window=60):
+        lim = SlidingWindowRateLimiter(
             key="test:burst",
-            capacity=capacity,
+            limit=limit,
             window_seconds=window,
             time_func=clock.time,
-            initial_tokens=initial_tokens,
         )
         lim.reset()
         return lim
 
     def test_500_jobs_no_loss_rate_respected_and_retry(self):
         clock = FakeClock()
-        capacity, window = 200, 60
-        limiter = self._limiter(clock, capacity, window)
+        limit, window = 200, 60
+        limiter = self._limiter(clock, limit, window)
 
         flaky_recipient = "user42@artikate.test"  # fails once, then succeeds
         jobs = EmailJob.objects.bulk_create(
@@ -172,7 +173,7 @@ class QueueBurstTests(TestCase):
         times = sorted(broker.send_times)
         for i, start in enumerate(times):
             window_count = sum(1 for t in times[i:] if t < start + window)
-            self.assertLessEqual(window_count, capacity)
+            self.assertLessEqual(window_count, limit)
 
         # 3. the flaky one retried and eventually went through
         flaky = EmailJob.objects.get(recipient=flaky_recipient)
@@ -181,7 +182,7 @@ class QueueBurstTests(TestCase):
 
     def test_permanent_failure_is_dead_lettered(self):
         clock = FakeClock()
-        limiter = self._limiter(clock, initial_tokens=200)
+        limiter = self._limiter(clock)
         job = EmailJob.objects.create(recipient="", kind=EmailJob.Kind.OTP)
         outcome, _ = tasks.process_email_job(job.id, limiter, retries=0)
         self.assertEqual(outcome, tasks.DEAD)
@@ -191,7 +192,7 @@ class QueueBurstTests(TestCase):
 
     def test_transient_failure_exhausts_to_dead_letter(self):
         clock = FakeClock()
-        limiter = self._limiter(clock, initial_tokens=200)
+        limiter = self._limiter(clock)
         job = EmailJob.objects.create(recipient="x@artikate.test")
 
         real_send = tasks.send_email
@@ -208,3 +209,33 @@ class QueueBurstTests(TestCase):
         self.assertEqual(outcome, tasks.DEAD)
         job.refresh_from_db()
         self.assertEqual(job.status, EmailJob.Status.DEAD)
+
+
+class _DenyLimiter:
+    """Always rate-limited."""
+
+    def acquire(self):
+        return RateLimitResult(False, 0, 0.3)
+
+
+class RateLimitRetryPolicyTests(TestCase):
+    """A rate-limited job must be rescheduled forever, never dropped. The unit
+    tests above use an in-process broker that reschedules indefinitely, so they
+    can't see a finite retry cap in the real Celery wrapper — this checks it."""
+
+    def test_task_retries_are_unlimited(self):
+        # A finite cap silently drops rate-limited jobs once a backlog exceeds
+        # it, so the task must allow unlimited retries.
+        self.assertIsNone(tasks.send_email_task.max_retries)
+
+    def test_rate_limited_job_reschedules_and_is_not_dropped(self):
+        job = EmailJob.objects.create(recipient="x@artikate.test")
+        with mock.patch.object(
+            tasks.send_email_task, "retry", side_effect=Retry("reschedule")
+        ) as retry:
+            with self.assertRaises(Retry):
+                tasks.send_email_task.run(job.id, limiter=_DenyLimiter())
+
+        self.assertTrue(retry.called)
+        job.refresh_from_db()
+        self.assertEqual(job.status, EmailJob.Status.QUEUED)

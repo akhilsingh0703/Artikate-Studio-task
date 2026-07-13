@@ -77,12 +77,12 @@ python manage.py migrate
 python manage.py submit_emails --count 500 --fail-rate 0.1
 ```
 
-The worker drains at ~200/min; the token bucket throttles the rest by
+The worker drains at ~200/min; the sliding-window limiter throttles the rest by
 rescheduling retries rather than sleeping. Poke at the state with:
 
 ```bash
 redis-cli llen celery
-redis-cli hgetall ratelimit:email:global
+redis-cli zcard ratelimit:email:global
 ```
 
 Sent/failed/dead-lettered jobs show up in the admin under Email jobs and Dead
@@ -107,7 +107,7 @@ The async-safety / `contextvars` discussion is in `ANSWERS.md` §3.
 ```
 config/     Django project + Celery app (config/celery.py)
 orders/     Section 1 — Customer/Order/OrderItem, summary endpoint, seed command
-emails/     Section 2 — EmailJob/DeadLetter, token-bucket limiter, Celery tasks
+emails/     Section 2 — EmailJob/DeadLetter, sliding-window limiter, Celery tasks
 tenants/    Section 3 — Tenant/Project, TenantManager, tenant middleware
 ```
 

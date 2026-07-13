@@ -5,12 +5,17 @@ from celery.utils.log import get_task_logger
 
 from .models import DeadLetter, EmailJob
 from .provider import EmailProviderError, PermanentEmailError, send_email
-from .rate_limiter import TokenBucketRateLimiter
+from .rate_limiter import SlidingWindowRateLimiter
 
 logger = get_task_logger(__name__)
 
 MAX_RETRIES = 5
-RATE_LIMIT_MAX_RETRIES = 50  # being throttled is normal under a burst
+# The task allows unlimited retries (see the decorator) because being throttled
+# is flow control, not a failure - a finite cap silently drops jobs once a
+# backlog is rate-limited more times than the cap. Real (provider) failures are
+# still bounded to MAX_RETRIES by the explicit check in process_email_job, so
+# they dead-letter instead of retrying forever.
+RATE_RETRY_JITTER_SECONDS = 1.0
 
 # outcomes returned by process_email_job
 SENT = "sent"
@@ -21,8 +26,8 @@ RETRY_ERROR = "retry_error"
 
 
 def email_rate_limiter():
-    # one global bucket shared by all workers = the provider-wide cap
-    return TokenBucketRateLimiter(key="email:global")
+    # one global window shared by all workers = the provider-wide cap
+    return SlidingWindowRateLimiter(key="email:global")
 
 
 def backoff_seconds(attempt):
@@ -79,12 +84,16 @@ def process_email_job(job_id, limiter, retries):
     return SENT, None
 
 
-@shared_task(bind=True, max_retries=MAX_RETRIES)
+# max_retries=None -> unlimited. self.retry(max_retries=None) does NOT mean
+# unlimited (Celery reads None there as "use the task default"), so it has to be
+# set here. The error path stays bounded by process_email_job's retries check.
+@shared_task(bind=True, max_retries=None)
 def send_email_task(self, job_id, limiter=None):
     limiter = limiter or email_rate_limiter()
     outcome, info = process_email_job(job_id, limiter, self.request.retries)
     if outcome == RETRY_RATE:
-        raise self.retry(countdown=info, max_retries=RATE_LIMIT_MAX_RETRIES)
+        countdown = info + random.uniform(0, RATE_RETRY_JITTER_SECONDS)
+        raise self.retry(countdown=countdown)
     if outcome == RETRY_ERROR:
         raise self.retry(countdown=info)
     return outcome
