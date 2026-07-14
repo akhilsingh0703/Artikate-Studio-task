@@ -9,7 +9,8 @@ Section map:
 - Section 1 — N+1 diagnosis and fix, with silk evidence — `orders/`, `ANSWERS.md` §1
 - Section 2 — rate-limited async email queue (Celery + Redis) — `emails/`, `DESIGN.md`
 - Section 3 — multi-tenant ORM isolation — `tenants/`, `ANSWERS.md` §3
-- Section 4 — architecture write-up (questions A and B) — `ANSWERS.md` §4
+- Section 4 — architecture write-up (questions A and B, plus bonus C) — `ANSWERS.md` §4
+- Section 5 (optional) — live demo recording — [`Live System Recording.mp4`](./Live%20System%20Recording.mp4)
 
 ## Requirements
 
