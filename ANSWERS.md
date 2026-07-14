@@ -145,7 +145,7 @@ so it's a safe drop-in for both.
 
 ## Section 4 — architecture review
 
-Answering questions A and B.
+The brief asks for any two of three. I answer A and B in full; C is included as a bonus.
 
 ### A. Django admin is slow on a table with 500,000+ rows (PK already indexed)
 
@@ -171,6 +171,18 @@ aren't indexed, which forces sequential scans and filesorts. Add `Meta.indexes`
 (which produce non-sargable `%term%`) with prefix search, or a `GinIndex` +
 `SearchVector` for Postgres full-text; and prefer `list_filter` entries backed by
 indexed columns, e.g. a `DateFieldListFilter` on an indexed date.
+
+Concretely, the changelist for that table would look like this:
+
+```python
+class OrderAdmin(admin.ModelAdmin):
+    list_display = ("id", "customer", "status", "created_at")
+    list_select_related = ("customer",)          # kills the per-row FK N+1
+    list_filter = ("status", ("created_at", admin.DateFieldListFilter))
+    search_fields = ("customer__name",)          # backed by an index, prefix search
+    show_full_result_count = False               # skip the full COUNT(*)
+    list_per_page = 50
+```
 
 The trade-offs: an estimated count is fast but not exact, and every extra index
 costs something on writes — both fine for an admin table that's read far more
@@ -202,3 +214,31 @@ mutation-stability matter — cursor is the right call. Offset is fine for small
 bounded, admin-style tables where users want page numbers and random access and
 the dataset is small enough that scanning discarded rows is cheap. For 10,000
 rows behind an infinite scroll, I'd default to cursor.
+
+### C. File upload security (bonus)
+
+Five attack vectors and how I'd mitigate each at the Django layer:
+
+1. **Disguised executable / wrong content type.** A `.php` or polyglot uploaded
+   as `image/png`. Never trust the browser's `Content-Type`; validate the real
+   bytes with magic numbers (`python-magic`) plus a `FileExtensionValidator`
+   allowlist, and store uploads in a location/`Storage` that never executes them.
+2. **Path traversal in the filename.** A name like `../../etc/passwd`. Don't use
+   the client filename directly — an `upload_to` callable that generates a name
+   (e.g. a UUID), relying on `Storage.get_valid_name` / `get_available_name` so
+   nothing escapes `MEDIA_ROOT` or overwrites an existing file.
+3. **Upload-size / decompression DoS.** A huge body or a zip/image bomb.
+   Cap `DATA_UPLOAD_MAX_MEMORY_SIZE` and `FILE_UPLOAD_MAX_MEMORY_SIZE`, validate
+   size in a form/serializer before processing, and bound image dimensions with
+   Pillow before doing any heavy work.
+4. **Stored XSS via SVG/HTML.** An SVG with an inline `<script>` served back
+   inline runs in the user's session. Disallow SVG (or sanitize it), and serve
+   uploads with `Content-Disposition: attachment` and `X-Content-Type-Options:
+   nosniff` so the browser downloads rather than renders them.
+5. **Image-parser exploits.** A crafted image targeting the decoder. Use
+   `ImageField` (which runs Pillow's verify on save), restrict allowed formats,
+   and keep Pillow patched — a malformed file is rejected before it's stored.
+
+The common thread: treat every upload as hostile, validate real content rather
+than declared metadata, and control both the stored name and how the file is
+later served.
