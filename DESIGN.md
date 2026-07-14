@@ -1,4 +1,96 @@
-# DESIGN.md — Section 2: rate-limited async job queue
+# DESIGN
+
+Architecture and design decisions for the Artikate Studio backend assessment.
+Section 2 (the rate-limited async job queue) is the required focus, but this
+document also covers the overall project layout and how the pieces fit together
+so a new engineer can find their way around quickly.
+
+---
+
+## 1. Project overview
+
+A single Django project with three focused apps, each mapping to one section of
+the assessment:
+
+| App        | Responsibility                                                                 |
+|------------|--------------------------------------------------------------------------------|
+| `orders`   | Order summary API + the N+1 diagnosis and fix (Section 1).                      |
+| `emails`   | Celery/Redis job queue, sliding-window rate limiter, retries, dead-letter (S2). |
+| `tenants`  | Automatic per-tenant ORM scoping via a custom manager + middleware (Section 3). |
+
+Design goals, in order: **correctness first** (no lost jobs, no cross-tenant
+leaks, a hard rate cap), then **readability**, then **easy local setup**. Nothing
+here needs a deployment — everything runs locally against SQLite + Redis.
+
+## 2. Tech stack
+
+- Python 3, Django 5 + Django REST Framework — API and ORM.
+- Celery 5 on a Redis broker/result backend — async task execution.
+- Redis — both the Celery broker and the rate-limiter store (one dependency, two
+  jobs).
+- django-silk — query profiling / N+1 evidence for Section 1.
+- SQLite — zero-setup local database (swap `DATABASES` for Postgres in prod).
+- PyJWT — decodes the tenant claim from the `Authorization` header.
+
+## 3. Project structure
+
+```
+artikate-backend/
+├── config/                     # project package (settings, urls, celery, wsgi/asgi)
+│   ├── settings.py             # apps, middleware, Celery + Redis, rate-limit knobs
+│   ├── urls.py                 # /admin, /silk, /api/orders, /api/tenants
+│   └── celery.py               # Celery app, autodiscovers tasks
+├── orders/                     # Section 1 — N+1 diagnosis and fix
+│   ├── models.py               # Customer, Order, OrderItem
+│   ├── serializers.py          # summary serializer (reads prefetched cache)
+│   ├── views.py                # summary_naive (broken) + order_summary (fixed)
+│   └── management/commands/seed_orders.py
+├── emails/                     # Section 2 — rate-limited async job queue
+│   ├── models.py               # EmailJob, DeadLetter
+│   ├── rate_limiter.py         # Redis sliding-window log (Lua, atomic)
+│   ├── tasks.py                # process_email_job() + send_email_task (Celery)
+│   ├── provider.py             # fake email provider (transient/permanent errors)
+│   └── management/commands/submit_emails.py
+├── tenants/                    # Section 3 — multi-tenant isolation
+│   ├── models.py               # Tenant, TenantManager, TenantScopedModel, Project
+│   ├── context.py              # thread-local current-tenant storage
+│   ├── middleware.py           # resolves tenant (JWT / X-Tenant / subdomain)
+│   ├── tokens.py               # JWT helpers
+│   └── management/commands/seed_tenants.py
+├── docs/                       # Silk evidence + screenshot report
+├── ANSWERS.md                  # written reasoning per section (S1, S2, S3, S4)
+├── DESIGN.md                   # this file
+└── README.md                   # 5-minute local setup + run guide
+```
+
+Convention: each app keeps its models, business logic, tests and any management
+commands together, so a section is self-contained and easy to review in
+isolation.
+
+## 4. Architecture at a glance
+
+**Request path.** `MIDDLEWARE` binds the tenant before any view runs, so every
+ORM query in `tenants` is scoped automatically — a developer can't forget a
+`.filter()`. Order APIs go through DRF; Silk wraps the whole cycle to record
+query counts.
+
+**Async path.** An API/CLI call creates an `EmailJob` row and enqueues
+`send_email_task` on Redis. A Celery worker pulls it, asks the Redis rate limiter
+for a slot, and either sends, reschedules (throttled), retries (transient), or
+dead-letters (permanent/exhausted). Redis is the single coordination point for
+both the queue and the rate cap.
+
+```
+producer ─► EmailJob (DB) ─► Redis (broker) ─► Celery worker
+                                                   │
+                                   Redis sliding-window limiter (≤200/60s)
+                                                   │
+                          send ── reschedule ── retry ── dead-letter
+```
+
+---
+
+# Section 2 — rate-limited async job queue
 
 ## Problem
 

@@ -1,7 +1,15 @@
-# ANSWERS.md
+# ANSWERS
 
-Written reasoning for each section. The code it refers to lives in the app
-packages named below.
+Written reasoning for each section of the assessment. Every explanation points at
+the exact module it describes, so the code and the reasoning can be read side by
+side.
+
+**Contents**
+
+- [Section 1 — Diagnosing a broken system](#section-1--diagnosing-a-broken-system)
+- [Section 2 — SIGKILL and in-flight tasks](#section-2--sigkill-what-happens-to-in-flight-tasks)
+- [Section 3 — Thread-local scoping under async Django](#section-3--thread-local-tenant-scoping-under-async-django)
+- [Section 4 — Architecture review (A & B)](#section-4--architecture-review)
 
 ---
 
